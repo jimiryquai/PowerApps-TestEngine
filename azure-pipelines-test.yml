@@ -1,0 +1,270 @@
+trigger:
+  - main # or your branch of choice
+
+pool:
+  vmImage: "windows-latest"
+
+variables:
+  - name: configuration
+    value: "Debug"
+
+steps:
+  - task: UseDotNet@2
+    displayName: "Install .NET SDK 8.0"
+    inputs:
+      version: "8.0.x"
+      includePreviewVersions: false
+
+  - task: PowerPlatformToolInstaller@2
+    displayName: "Install Power Platform CLI and BuildTools"
+    inputs:
+      DefaultVersion: true
+      AddToolsToPath: true
+
+  - task: PowerPlatformSetConnectionVariables@2
+    displayName: "Set Power Platform Connection Variables"
+    inputs:
+      authenticationType: "PowerPlatformSPN"
+      PowerPlatformSPN: "jamesryan-copilot"
+      Environment: "https://jamesryan-copilot.crm.dynamics.com/"
+
+  - task: AzureCLI@2
+    displayName: "Login to Azure"
+    inputs:
+      azureSubscription: "azure-service-connection" # Hard-coded Azure service connection name
+      scriptType: "ps"
+      scriptLocation: "inlineScript"
+      inlineScript: |
+        Write-Host "Logging into Azure using service principal..."
+        # The task will handle the authentication using the service connection
+        # This ensures non-interactive authentication
+
+        # Check if login was successful
+        $loginStatus = az account show
+        if ($LASTEXITCODE -eq 0) {
+          Write-Host "Successfully logged into Azure"
+        } else {
+          Write-Error "Failed to log into Azure"
+          exit 1
+        }
+
+  - task: PowerShell@2
+    displayName: "Create self-signed certificate for TestEngine"
+    inputs:
+      targetType: "inline"
+      script: |
+        # Set execution policy to bypass for the current process
+        Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+        Write-Host "Creating self-signed certificate for TestEngine authentication..."
+
+        $Params = @{
+          DnsName = @("localhost", "localhost")
+          CertStoreLocation = "Cert:\CurrentUser\My"
+          NotAfter = (Get-Date).AddMonths(6)
+          KeyAlgorithm = "RSA"
+          KeyLength = 2048
+        }
+
+        $cert = New-SelfSignedCertificate @Params
+        Write-Host "Certificate created successfully with thumbprint: $($cert.Thumbprint)"
+        Write-Host "Certificate subject: $($cert.Subject)"
+
+        # Verify the certificate is in the store
+        $certFromStore = Get-ChildItem -Path "Cert:\CurrentUser\My" | Where-Object { $_.Subject -eq "CN=localhost" }
+        if ($certFromStore) {
+          Write-Host "Certificate verified in certificate store"
+        } else {
+          Write-Error "Certificate not found in certificate store"
+          exit 1
+        }
+
+  - task: PowerShell@2
+    displayName: "Create config.json"
+    env:
+      PP_TENANT_ID: "$(PowerPlatformSetConnectionVariables.BuildTools.TenantId)"
+    inputs:
+      targetType: "inline"
+      script: |
+        # Use the correct environment ID from the existing config
+        $environmentId = "fa264f9a-9c5c-eb82-b9d6-dbc4c1016403"
+        $environmentUrl = "https://jamesryan-copilot.crm.dynamics.com/"
+
+        Write-Host "Using Environment ID: $environmentId"
+        Write-Host "Using Environment URL: $environmentUrl"
+
+        $configJson = @{
+          "tenantId" = $env:PP_TENANT_ID
+          "environmentId" = $environmentId
+          "customPage" = "te_snapshots_24d69"
+          "appDescription" = "Weather Snapshot"
+          "user1Email" = "james@jamesryan.dev"
+          "runInstall" = $true
+          "installPlaywright" = $true
+          "DataProtectionUrl" = $environmentUrl
+          "DataProtectionCertificateName" = "CN=localhost"
+          "auth" = "certstore"
+          "authstate" = "dataverse"
+          "extensionModules" = @(
+            "testengine.auth.certificatestore.dll"
+          )
+          "configuration" = "$(configuration)"
+        } | ConvertTo-Json -Depth 10
+
+        # Ensure the samples/weather directory exists
+        $configDir = "$(Build.SourcesDirectory)/samples/weather"
+        if (-not (Test-Path $configDir)) {
+            New-Item -ItemType Directory -Path $configDir -Force
+        }
+
+        Set-Content -Path "$configDir/config.json" -Value $configJson
+        Write-Host "Created config.json with content: $configJson"
+
+  - task: PowerShell@2
+    displayName: "Authenticate Power Platform CLI"
+    env:
+      PP_TENANT_ID: "$(PowerPlatformSetConnectionVariables.BuildTools.TenantId)"
+      PP_CLIENT_ID: "$(PowerPlatformSetConnectionVariables.BuildTools.ApplicationId)"
+      PP_CLIENT_SECRET: "$(PowerPlatformSetConnectionVariables.BuildTools.ClientSecret)"
+    inputs:
+      targetType: "inline"
+      script: |
+        Write-Host "Authenticating Power Platform CLI using service principal"
+
+        # First verify pac CLI is available
+        $pacPath = Get-Command pac -ErrorAction SilentlyContinue
+        if (-not $pacPath) {
+          Write-Error "pac CLI not found in PATH. Please ensure PowerPlatformToolInstaller has run successfully."
+          exit 1
+        } else {
+          Write-Host "pac CLI found at: $($pacPath.Source)"
+        }
+
+        # Get credentials from environment variables
+        $tenantId = $env:PP_TENANT_ID
+        $clientId = $env:PP_CLIENT_ID
+        $clientSecret = $env:PP_CLIENT_SECRET
+
+        # Validate credentials are available
+        if ([string]::IsNullOrEmpty($tenantId) -or [string]::IsNullOrEmpty($clientId) -or [string]::IsNullOrEmpty($clientSecret)) {
+          Write-Host "PP_TENANT_ID available: $(-not [string]::IsNullOrEmpty($tenantId))"
+          Write-Host "PP_CLIENT_ID available: $(-not [string]::IsNullOrEmpty($clientId))"
+          Write-Host "Client Secret available: $(-not [string]::IsNullOrEmpty($clientSecret))"
+          Write-Error "One or more required credential variables are missing"
+          exit 1
+        }
+
+        # Create auth profile with pac auth create
+        pac auth create --name "BuildAgent" --tenant "$tenantId" --applicationId "$clientId" --clientSecret "$clientSecret"
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Failed to authenticate pac CLI with service principal"
+          exit 1
+        }
+
+        # Select the profile
+        pac auth select --name "BuildAgent"
+
+  - task: PowerShell@2
+    displayName: "Run Tests"
+    env:
+      POWERAPPS_TENANTID: "$(PowerPlatformSetConnectionVariables.BuildTools.TenantId)"
+      POWERAPPS_CLIENTID: "$(PowerPlatformSetConnectionVariables.BuildTools.ApplicationId)"
+      POWERAPPS_CLIENTSECRET: "$(PowerPlatformSetConnectionVariables.BuildTools.ClientSecret)"
+      POWERAPPS_ENVIRONMENTURL: "$(PowerPlatformSetConnectionVariables.BuildTools.DataverseConnectionString)"
+    inputs:
+      targetType: "inline"
+      workingDirectory: "$(Build.SourcesDirectory)/samples/weather"
+      script: |
+        # Verify environment variables
+        $tenantId = $env:POWERAPPS_TENANTID
+        $clientId = $env:POWERAPPS_CLIENTID
+        $clientSecret = $env:POWERAPPS_CLIENTSECRET
+        $environmentUrl = $env:POWERAPPS_ENVIRONMENTURL
+
+        Write-Host "Using TenantId: $tenantId"
+        Write-Host "Using EnvironmentUrl: $environmentUrl"
+
+        # Check for test plan
+        $testPlanPath = "$(Build.SourcesDirectory)/samples/weather/testPlan.fx.yaml"
+        if (-not (Test-Path $testPlanPath)) {
+            Write-Error "Test plan not found at: $testPlanPath"
+            exit 1
+        }
+
+        # Build the latest version of Test Engine from source (just like RunTests.ps1 does)
+        Write-Host "Building TestEngine from source..."
+        Set-Location "$(Build.SourcesDirectory)/src"
+        dotnet build --configuration $(configuration)
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Build failed with exit code $LASTEXITCODE"
+            exit 1
+        }
+        Write-Host "Build completed successfully"
+
+        # Also publish to ensure all runtime files are generated
+        Write-Host "Publishing TestEngine to generate all runtime files..."
+        dotnet publish "$(Build.SourcesDirectory)/src/PowerAppsTestEngineWrapper/PowerAppsTestEngineWrapper.csproj" --configuration $(configuration) --framework net8.0 --no-build
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Publish failed with exit code $LASTEXITCODE"
+            exit 1
+        }
+        Write-Host "Publish completed successfully"
+
+        # Prepare output directory
+        $outputDir = "$(Build.ArtifactStagingDirectory)/TestResults"
+        if (-not (Test-Path $outputDir)) {
+            New-Item -ItemType Directory -Path $outputDir -Force
+        }
+
+        # Look for TestEngine binaries
+        $testEnginePath = "$(Build.SourcesDirectory)/bin/$(configuration)/PowerAppsTestEngine"
+        $wrapperPath = "$(Build.SourcesDirectory)/bin/$(configuration)/PowerAppsTestEngineWrapper"
+        $exePath = "$wrapperPath/PowerAppsTestEngineWrapper.exe"
+        $dllPath = "$wrapperPath/PowerAppsTestEngineWrapper.dll"
+
+        Write-Host "Checking for binaries..."
+        Write-Host "TestEngine path: $testEnginePath"
+        Write-Host "Wrapper path: $wrapperPath"
+        Write-Host "Exe path exists: $(Test-Path $exePath)"
+        Write-Host "DLL path exists: $(Test-Path $dllPath)"
+
+        # List directories to help diagnose issues
+        Write-Host "Listing bin directory contents:"
+        Get-ChildItem -Path "$(Build.SourcesDirectory)/bin" -Recurse | Select-Object FullName
+
+        # Change to the wrapper directory
+        Set-Location $wrapperPath
+
+        Write-Host "Running TestEngine..."
+
+        # Run the test engine
+        if (Test-Path .\PowerAppsTestEngineWrapper.exe) {
+          Write-Host "Using PowerAppsTestEngineWrapper.exe"
+          .\PowerAppsTestEngineWrapper.exe -u "dataverse" --provider "mda" -a "certstore" -i "$testPlanPath" -t $tenantId -e $environmentId -d "$environmentUrl" -l Debug --outputDirectory "$outputDir" --clientId "$clientId" --clientSecret "$clientSecret"
+        }
+        else {
+          Write-Host "Falling back to PowerAppsTestEngineWrapper.dll"
+          dotnet PowerAppsTestEngineWrapper.dll -u "dataverse" --provider "mda" -a "certstore" -i "$testPlanPath" -t $tenantId -e $environmentId -d "$environmentUrl" -l Debug --outputDirectory "$outputDir" --clientId "$clientId" --clientSecret "$clientSecret"
+        }
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Test execution failed with exit code $LASTEXITCODE"
+          exit 1
+        }
+
+        Write-Host "Test execution completed successfully"
+
+  - task: PublishTestResults@2
+    displayName: "Publish Test Results"
+    inputs:
+      testResultsFormat: "JUnit"
+      testResultsFiles: "$(Build.ArtifactStagingDirectory)/TestResults/*.xml"
+      failTaskOnFailedTests: true
+
+  - task: PublishBuildArtifacts@1
+    displayName: "Publish Test Output"
+    inputs:
+      PathtoPublish: "$(Build.ArtifactStagingDirectory)/TestResults"
+      ArtifactName: "TestResults"
+      publishLocation: "Container"

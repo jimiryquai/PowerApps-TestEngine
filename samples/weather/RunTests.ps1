@@ -16,12 +16,12 @@ $env:DataProtectionCertificateName = $config.DataProtectionCertificateName
 $configuration = $config.configuration
 
 if ([string]::IsNullOrEmpty($configuration)) {
-    $configuration = "Debug"
+  $configuration = "Debug"
 }
 
 if ([string]::IsNullOrEmpty($environmentId)) {
-    Write-Error "Environment not configured. Please update config.json"
-    return
+  Write-Error "Environment not configured. Please update config.json"
+  return
 }
 
 $foundEnvironment = $false
@@ -33,47 +33,87 @@ $environmentUrl = ""
 Write-Host "Searching for $environmentId"
 
 foreach ($line in $textResult) {
-    if ($line -match $environmentId) {
-        if ($line -match "(https://\S+/)") {
-            $environmentUrl = $matches[0].Substring(0,$matches[0].Length - 1)
-            $foundEnvironment = $true
-            break
-        }
+  if ($line -match $environmentId) {
+    if ($line -match "(https://\S+/)") {
+      $environmentUrl = $matches[0].Substring(0, $matches[0].Length - 1)
+      $foundEnvironment = $true
+      break
     }
+  }
 }
 
 if ($foundEnvironment) {
-    Write-Output "Found matching Environment URL: $environmentUrl"
-} else {
-    Write-Output "Environment ID not found."
-    return
+  Write-Output "Found matching Environment URL: $environmentUrl"
+}
+else {
+  Write-Output "Environment ID not found."
+  return
 }
 
 $token = (az account get-access-token --resource $environmentUrl | ConvertFrom-Json)
 
 $uri = "$environmentUrl/api/data/v9.1/systemusers?`$filter=internalemailaddress eq '$user1Email'"
-$response = Invoke-RestMethod -Uri $uri -Method Get -Headers @{Authorization = "Bearer $($token.accessToken)"}
+$response = Invoke-RestMethod -Uri $uri -Method Get -Headers @{Authorization = "Bearer $($token.accessToken)" }
 $userId = $response.value.systemuserid
 
 Write-Host $userId
 
 $uri = "$environmentUrl/api/data/v9.1/usersettingscollection($userId)"
 $body = @{
-    uilanguageid = 1033  # English
+  uilanguageid = 1033  # English
 } | ConvertTo-Json
-Invoke-RestMethod -Uri $uri -Method Patch -Headers @{Authorization = "Bearer $($token.accessToken)"; "Content-Type" = "application/json"} -Body $body
+Invoke-RestMethod -Uri $uri -Method Patch -Headers @{Authorization = "Bearer $($token.accessToken)"; "Content-Type" = "application/json" } -Body $body
 
-$appId = ""
-try{
-    $runResult = pac pfx run --file .\GetAppId.powerfx --echo
-    $appId = $runResult[8].Split('"')[1] -replace '[^a-zA-Z0-9-]', ''
-} catch {
+# $appId = ""
+# try{
+#     $runResult = pac pfx run --file .\GetAppId.powerfx --echo
+#     $appId = $runResult[8].Split('"')[1] -replace '[^a-zA-Z0-9-]', ''
+# } catch {
 
+# }
+
+# if ([string]::IsNullOrEmpty($appId)) {
+#     Write-Error "App id not found. Check that the $appDescription has been installed"
+#     return
+# }
+
+# Try to dynamically retrieve the appId using the Dataverse Web API
+$appId = $null
+try {
+  $headers = @{
+    "Authorization"    = "Bearer $($token.accessToken)"
+    "OData-MaxVersion" = "4.0"
+    "OData-Version"    = "4.0"
+    "Accept"           = "application/json"
+    "Content-Type"     = "application/json; charset=utf-8"
+  }
+  $uri = "$environmentUrl/api/data/v9.1/appmodules?`$filter=uniquename eq 'te_WeatherSnapshots'"
+  $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
+  if ($response.value.Count -gt 0) {
+    $descriptor = $response.value[0].descriptor
+    try {
+      $jsonObj = $descriptor | ConvertFrom-Json
+      $appId = $jsonObj.appInfo.AppId
+      Write-Host "[INFO] Extracted appId from descriptor via API: $appId"
+    }
+    catch {
+      Write-Host "[WARN] Failed to parse descriptor JSON from API. Falling back to config.appId."
+      $appId = $config.appId
+    }
+  }
+  else {
+    Write-Host "[WARN] No app found with uniquename 'te_WeatherSnapshots'. Falling back to config.appId."
+    $appId = $config.appId
+  }
+}
+catch {
+  Write-Host "[ERROR] Exception while retrieving appId from API: $_. Falling back to config.appId."
+  $appId = $config.appId
 }
 
 if ([string]::IsNullOrEmpty($appId)) {
-    Write-Error "App id not found. Check that the $appDescription has been installed"
-    return
+  Write-Error "App id not found. Check that the $appDescription has been installed"
+  return
 }
 
 $customPage = $config.customPage
@@ -84,37 +124,39 @@ Set-Location ..\..\src
 dotnet build --configuration $configuration
 
 if ($config.installPlaywright) {
-    Start-Process -FilePath "pwsh" -ArgumentList "-Command `"..\bin\$configuration\PowerAppsTestEngine\playwright.ps1 install`"" -Wait
-} else {
-    Write-Host "Skipped playwright install"
+  Start-Process -FilePath "pwsh" -ArgumentList "-Command `"..\bin\$configuration\PowerAppsTestEngine\playwright.ps1 install`"" -Wait
+}
+else {
+  Write-Host "Skipped playwright install"
 }
 
 Set-Location "..\bin\$configuration\PowerAppsTestEngine"
 $env:user1Email = $user1Email
 
 if ($null -eq $languages) {
-    # Run the tests for each user in the configuration file.
-    dotnet PowerAppsTestEngine.dll -u "dataverse" --provider "mda" -a "none" -i "$currentDirectory\testPlan.fx.yaml" -t $tenantId -e $environmentId -d "$mdaUrl" -l Debug
-} else {
-    foreach ($language in $languages) {
-        $uri = "$environmentUrl/api/data/v9.1/usersettingscollection($userId)"
-        $body = @{
-            uilanguageid = $language.id
-        } | ConvertTo-Json
-        Invoke-RestMethod -Uri $uri -Method Patch -Headers @{Authorization = "Bearer $($token.accessToken)"; "Content-Type" = "application/json"} -Body $body
+  # Run the tests for each user in the configuration file.
+  dotnet PowerAppsTestEngine.dll -u "dataverse" --provider "mda" -a "certstore" -i "$currentDirectory\testPlan.fx.yaml" -t $tenantId -e $environmentId -d "$mdaUrl" -l Debug
+}
+else {
+  foreach ($language in $languages) {
+    $uri = "$environmentUrl/api/data/v9.1/usersettingscollection($userId)"
+    $body = @{
+      uilanguageid = $language.id
+    } | ConvertTo-Json
+    Invoke-RestMethod -Uri $uri -Method Patch -Headers @{Authorization = "Bearer $($token.accessToken)"; "Content-Type" = "application/json" } -Body $body
 
-        $languageId = $language.id
-        $languageName = $language.name
-        $languageFile = $language.file
+    $languageId = $language.id
+    $languageName = $language.name
+    $languageFile = $language.file
 
-        $languageTest = "$currentDirectory\testPlan-${languageId}.fx.yaml"
-        Copy-Item "$currentDirectory\$languageFile" $languageTest
-        $text = Get-Content  $languageTest 
-        $text = $text.Replace("locale: ""en-US""", "locale: ""${languageName}""")
-        Set-Content -Path  $languageTest -Value $text 
+    $languageTest = "$currentDirectory\testPlan-${languageId}.fx.yaml"
+    Copy-Item "$currentDirectory\$languageFile" $languageTest
+    $text = Get-Content  $languageTest 
+    $text = $text.Replace("locale: ""en-US""", "locale: ""${languageName}""")
+    Set-Content -Path  $languageTest -Value $text 
 
-        dotnet PowerAppsTestEngine.dll -u "dataverse" --provider "mda" -a "certstore" -i "$languageTest" -t $tenantId -e $environmentId -d "$mdaUrl" -l Debug -w True
-    }
+    dotnet PowerAppsTestEngine.dll -u "dataverse" --provider "mda" -a "certstore" -i "$languageTest" -t $tenantId -e $environmentId -d "$mdaUrl" -l Debug -w True
+  }
 }
 
 # Reset the location back to the original directory.
